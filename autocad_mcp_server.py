@@ -2282,6 +2282,252 @@ def draw_enlarged_detail_callout(
 
 
 # ============================================================================
+# 5. PaperSpace Layout & Enlarged-Plan Viewports (1000 units = 1 m, paper in mm)
+# ============================================================================
+
+_STD_SCALES = [10, 20, 25, 30, 40, 50, 75, 100, 125, 150, 200, 250, 500]
+
+
+def _detect_safe_zone_mm(doc, layout) -> Dict[str, Any]:
+    """
+    Detect ISO sheet size and the safe drawable box on a PaperSpace layout.
+    Calibrated from the IX ONE ONE A3 template (right-hand title strip), then refined by
+    scanning PaperSpace entities that sit inside the right-hand strip.
+    """
+    paper_w, paper_h = layout.GetPaperSize()
+    if int(layout.PlotRotation) in (1, 3):
+        paper_w, paper_h = paper_h, paper_w
+
+    longer = max(paper_w, paper_h)
+    iso = "A4" if longer < 330 else "A3" if longer < 500 else "A2" if longer < 700 else "A1"
+
+    k = paper_w / 420.0
+
+    # Sheet origin: this template does NOT start at paper (0,0). The title-block xref is
+    # inserted at the sheet's lower-left corner (e.g. 1077.625, 8863.564), so every paper
+    # coordinate must be offset by it or the viewport lands off the sheet.
+    ox, oy, origin_src = 0.0, 0.0, "paper_zero"
+    ps = doc.PaperSpace
+    for i in range(ps.Count):
+        ent = ps.Item(i)
+        if ent.ObjectName == "AcDbBlockReference":
+            nm = str(getattr(ent, "EffectiveName", ent.Name)).upper()
+            if "TITLE" in nm:
+                ip = ent.InsertionPoint
+                ox, oy, origin_src = float(ip[0]), float(ip[1]), "titleblock_insertion"
+                break
+    if origin_src == "paper_zero":
+        for i in range(ps.Count):
+            ent = ps.Item(i)
+            if ent.ObjectName == "AcDbViewport" and abs(ent.Width - paper_w) < 1.0 and abs(ent.Height - paper_h) < 1.0:
+                cx, cy, _z = ent.Center
+                ox, oy, origin_src = cx - paper_w / 2.0, cy - paper_h / 2.0, "fullsheet_viewport"
+                break
+
+    safe_min_x = 8.0 * k
+    safe_min_y = 8.0 * k
+    safe_max_y = paper_h - 11.0 * k
+    safe_max_x = paper_w * 0.871
+    source = "template_ratio"
+
+    strip_left: List[float] = []
+    for i in range(ps.Count):
+        ent = ps.Item(i)
+        if ent.ObjectName == "AcDbViewport":
+            continue
+        try:
+            bb = _read_bbox(ent)
+        except Exception:
+            continue
+        rx1, rx2 = bb["x1"] - ox, bb["x2"] - ox
+        if bb["width"] < paper_w * 0.35 and rx1 > paper_w * 0.68 and rx2 <= paper_w + 5.0:
+            strip_left.append(rx1)
+    if strip_left:
+        safe_max_x = min(strip_left) - 4.0 * k
+        source = "scanned_titleblock"
+
+    return {
+        "iso": iso, "paper_w": paper_w, "paper_h": paper_h,
+        "origin": [round(ox, 3), round(oy, 3)], "origin_source": origin_src,
+        "min_x": round(ox + safe_min_x, 1), "min_y": round(oy + safe_min_y, 1),
+        "max_x": round(ox + safe_max_x, 1), "max_y": round(oy + safe_max_y, 1),
+        "source": source,
+    }
+
+
+def _activate_paperspace(doc, layout_name: str):
+    layout = doc.Layouts.Item(layout_name)
+    doc.ActiveLayout = layout
+    if int(doc.ActiveSpace) != 0:
+        doc.ActiveSpace = 0
+    return layout
+
+
+@mcp.tool()
+def inspect_layout_template(layout_name: str) -> Dict[str, Any]:
+    """
+    Read-only survey of a PaperSpace tab BEFORE placing viewports: ISO size, safe drawable box
+    (avoids the right-hand title block), existing viewports, and a suggested centre point.
+    """
+    if layout_name.strip().lower() == "model":
+        return {"error": "Cannot inspect 'Model' as a PaperSpace sheet."}
+    with autocad_session() as (_, doc):
+        def _inspect():
+            layout = _activate_paperspace(doc, layout_name)
+            z = _detect_safe_zone_mm(doc, layout)
+            vps = []
+            ps = doc.PaperSpace
+            for i in range(ps.Count):
+                ent = ps.Item(i)
+                if ent.ObjectName == "AcDbViewport" and i > 0:
+                    cx, cy, _z = ent.Center
+                    sc = float(ent.CustomScale)
+                    vps.append({
+                        "handle": ent.Handle,
+                        "center_mm": [round(cx, 2), round(cy, 2)],
+                        "size_mm": [round(ent.Width, 2), round(ent.Height, 2)],
+                        "custom_scale": round(sc, 6),
+                        "approx_scale": f"1:{round(1.0 / sc)}" if sc > 0 else "unscaled",
+                        "locked": bool(ent.DisplayLocked),
+                    })
+            return {
+                "layout_name": layout.Name,
+                "iso_sheet_detected": z["iso"],
+                "paper_size_mm": [round(z["paper_w"], 1), round(z["paper_h"], 1)],
+                "sheet_origin_mm": z["origin"],
+                "sheet_origin_source": z["origin_source"],
+                "safe_drawable_box_mm": {
+                    "min_x": z["min_x"], "min_y": z["min_y"], "max_x": z["max_x"], "max_y": z["max_y"],
+                    "width": round(z["max_x"] - z["min_x"], 1),
+                    "height": round(z["max_y"] - z["min_y"], 1),
+                    "source": z["source"],
+                    "note": "absolute PaperSpace coordinates (sheet origin already added)",
+                },
+                "safe_center_mm": [round((z["min_x"] + z["max_x"]) / 2, 1),
+                                   round((z["min_y"] + z["max_y"]) / 2, 1)],
+                "existing_viewports": vps,
+            }
+        return com_retry(_inspect)
+
+
+@mcp.tool()
+def place_enlarged_viewport_auto(
+    layout_name: str,
+    model_min_x: float,
+    model_min_y: float,
+    model_max_x: float,
+    model_max_y: float,
+    scale_denominator: int = 25,
+    slot: str = "full",
+    paper_center_x: Optional[float] = None,
+    paper_center_y: Optional[float] = None,
+    model_margin_mm: float = 600.0,
+    vp_freeze_layers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Place a locked, exact-scale PaperSpace viewport aimed at a ModelSpace box (1000 units = 1 m).
+    Frame size = (model span + 2*margin) / scale. Rejected (nothing created) if it would overflow
+    the safe zone, returning a recommended standard scale.
+    slot: full | left_half | right_half | top_left | top_right | bottom_left | bottom_right.
+    The frame goes on DEFPOINTS (non-plotting); PSLTSCALE is forced to 1.
+    """
+    if layout_name.strip().lower() == "model":
+        return {"error": "Target layout must be a PaperSpace tab, not 'Model'."}
+    with autocad_session() as (app, doc):
+        def _place():
+            layout = _activate_paperspace(doc, layout_name)
+            z = _detect_safe_zone_mm(doc, layout)
+
+            mid_x = (z["min_x"] + z["max_x"]) / 2.0
+            mid_y = (z["min_y"] + z["max_y"]) / 2.0
+            zones = {
+                "full": (z["min_x"], z["min_y"], z["max_x"], z["max_y"]),
+                "left_half": (z["min_x"], z["min_y"], mid_x - 3, z["max_y"]),
+                "right_half": (mid_x + 3, z["min_y"], z["max_x"], z["max_y"]),
+                "top_left": (z["min_x"], mid_y + 3, mid_x - 3, z["max_y"]),
+                "top_right": (mid_x + 3, mid_y + 3, z["max_x"], z["max_y"]),
+                "bottom_left": (z["min_x"], z["min_y"], mid_x - 3, mid_y - 3),
+                "bottom_right": (mid_x + 3, z["min_y"], z["max_x"], mid_y - 3),
+            }
+            if slot not in zones:
+                return {"error": f"Unknown slot '{slot}'. Use one of {sorted(zones)}."}
+            z0x, z0y, z1x, z1y = zones[slot]
+            avail_w, avail_h = z1x - z0x, z1y - z0y
+
+            x0, x1 = sorted([model_min_x, model_max_x])
+            y0, y1 = sorted([model_min_y, model_max_y])
+            mcx, mcy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            span_w = (x1 - x0) + 2.0 * model_margin_mm
+            span_h = (y1 - y0) + 2.0 * model_margin_mm
+
+            custom_scale = 1.0 / float(scale_denominator)
+            vp_w, vp_h = span_w * custom_scale, span_h * custom_scale
+
+            if vp_w > avail_w or vp_h > avail_h:
+                need = max(span_w / max(avail_w, 1.0), span_h / max(avail_h, 1.0))
+                rec = next((s for s in _STD_SCALES if s >= need), round(need))
+                return {
+                    "status": "rejected_overflow", "iso_sheet": z["iso"], "slot": slot,
+                    "requested_scale": f"1:{scale_denominator}",
+                    "required_frame_mm": [round(vp_w, 1), round(vp_h, 1)],
+                    "available_zone_mm": [round(avail_w, 1), round(avail_h, 1)],
+                    "recommended_standard_scale": f"1:{rec}",
+                }
+
+            cx = paper_center_x if paper_center_x is not None else (z0x + z1x) / 2.0
+            cy = paper_center_y if paper_center_y is not None else (z0y + z1y) / 2.0
+            cx = max(z0x + vp_w / 2.0, min(cx, z1x - vp_w / 2.0))
+            cy = max(z0y + vp_h / 2.0, min(cy, z1y - vp_h / 2.0))
+
+            try:
+                doc.Layers.Item("DEFPOINTS")
+            except Exception:
+                doc.Layers.Add("DEFPOINTS")
+
+            pvp = doc.PaperSpace.AddPViewport(pt3d(cx, cy, 0.0), vp_w, vp_h)
+            pvp.Layer = "DEFPOINTS"
+            pvp.Display(True)  # must be ON before aiming/scaling
+
+            # Aim the camera at the model box centre, then apply the exact scale
+            pvp.Target = pt3d(mcx, mcy, 0.0)
+            pvp.CustomScale = custom_scale
+
+            freeze_note = "none"
+            if vp_freeze_layers:
+                csv = ",".join(n.strip() for n in vp_freeze_layers if n.strip())
+                if csv:
+                    try:
+                        doc.MSpace = True
+                        doc.ActivePViewport = pvp
+                        doc.SendCommand(f"._VPLAYER _Freeze {csv} _Current \n")
+                        freeze_note = csv
+                    except Exception as exc:
+                        freeze_note = f"skipped ({exc.__class__.__name__}) - freeze manually via VPLAYER"
+                    finally:
+                        with contextlib.suppress(Exception):
+                            doc.MSpace = False
+
+            pvp.CustomScale = custom_scale
+            pvp.DisplayLocked = True
+            doc.SetVariable("PSLTSCALE", 1)
+            doc.Regen(1)
+
+            return {
+                "status": "placed_and_locked",
+                "handle": pvp.Handle, "layout": layout.Name,
+                "iso_sheet": z["iso"], "slot": slot,
+                "scale": f"1:{scale_denominator}",
+                "paper_center_mm": [round(cx, 2), round(cy, 2)],
+                "paper_frame_mm": [round(vp_w, 2), round(vp_h, 2)],
+                "model_target": [round(mcx, 2), round(mcy, 2)],
+                "vp_frozen_layers": freeze_note,
+                "recommended_model_text_height_mm": round(2.5 * scale_denominator, 1),
+                "next": "Verify with capture_drawing_view - target/scale were set via COM, not visually confirmed.",
+            }
+        return com_retry(_place)
+
+
+# ============================================================================
 # Safe Execution & Saving
 # ============================================================================
 
@@ -2316,6 +2562,281 @@ def save_drawing() -> str:
             doc.Save()
             return f"Saved '{doc.FullName}' successfully."
         return com_retry(_save)
+
+
+# ==============================================================================
+# SECTION: ADVANCED PAPERSPACE LAYOUT & TAB MANAGEMENT
+# ==============================================================================
+
+_INVALID_LAYOUT_CHARS = re.compile(r'[<>/\\":;?*|,=`]')
+
+
+def _validate_layout_name(name: str) -> Optional[str]:
+    clean = name.strip()
+    if not clean:
+        return "Layout name cannot be empty."
+    if clean.lower() == "model":
+        return "'Model' is a reserved system tab name."
+    if len(clean) > 255:
+        return f"Layout name '{clean[:30]}...' exceeds 255 characters."
+    if _INVALID_LAYOUT_CHARS.search(clean):
+        return f"Layout name '{clean}' contains forbidden AutoCAD characters (< > / \\ \" : ; ? * | , = `)."
+    return None
+
+
+def _get_ordered_ps_layouts(doc) -> List[Any]:
+    """Return all PaperSpace layout COM objects sorted by visual TabOrder (1..N)."""
+    ps_layouts = []
+    for i in range(doc.Layouts.Count):
+        lyt = doc.Layouts.Item(i)
+        if lyt.Name.lower() != "model":
+            ps_layouts.append(lyt)
+    ps_layouts.sort(key=lambda x: x.TabOrder)
+    return ps_layouts
+
+
+@mcp.tool()
+def list_layout_tabs() -> Dict[str, Any]:
+    """
+    List all PaperSpace Layout tabs in their exact left-to-right visual order,
+    including paper dimensions, plot style (.ctb), and viewport count.
+    """
+    with autocad_session() as (_, doc):
+        def _list():
+            tabs = []
+            for lyt in _get_ordered_ps_layouts(doc):
+                pw, ph = lyt.GetPaperSize()
+                if lyt.PlotRotation in (1, 3):
+                    pw, ph = ph, pw
+
+                longer = max(pw, ph)
+                iso = "A4" if longer < 330 else "A3" if longer < 500 else "A2" if longer < 700 else "A1"
+
+                blk = lyt.Block
+                vp_count = 0
+                for k in range(1, blk.Count):
+                    if blk.Item(k).ObjectName == "AcDbViewport":
+                        vp_count += 1
+
+                tabs.append({
+                    "tab_order": lyt.TabOrder,
+                    "name": lyt.Name,
+                    "iso_size": iso,
+                    "paper_mm": [round(pw, 1), round(ph, 1)],
+                    "plotter": lyt.ConfigName,
+                    "ctb_style": lyt.StyleSheet,
+                    "viewport_count": vp_count,
+                })
+
+            return {
+                "active_layout": doc.ActiveLayout.Name,
+                "total_paperspace_tabs": len(tabs),
+                "tabs": tabs,
+            }
+        return com_retry(_list)
+
+
+@mcp.tool()
+def batch_clone_layouts(
+    source_layout: str,
+    new_layout_names: List[str],
+    insert_after_layout: Optional[str] = None,
+    clear_existing_viewports: bool = True,
+    skip_if_exists: bool = True,
+) -> Dict[str, Any]:
+    """
+    Clone a master/template Layout tab into multiple new PaperSpace tabs in one step.
+    Copies exact Page Setup (A3/A4/A2/A1, plotter, CTB) and Title Block geometry
+    WITHOUT modifying any Title Block text or sheet IDs.
+    """
+    with autocad_session() as (_, doc):
+        def _clone():
+            if not new_layout_names:
+                return {"error": "new_layout_names list cannot be empty."}
+
+            existing_map = {
+                doc.Layouts.Item(i).Name.lower(): doc.Layouts.Item(i)
+                for i in range(doc.Layouts.Count)
+            }
+            src_lyt = existing_map.get(source_layout.strip().lower())
+            if src_lyt is None or src_lyt.Name.lower() == "model":
+                return {"error": f"Source layout '{source_layout}' not found or is 'Model'."}
+
+            cleaned_targets = []
+            seen_lower = set()
+            for raw_name in new_layout_names:
+                err = _validate_layout_name(raw_name)
+                if err:
+                    return {"error": err}
+                cname = raw_name.strip()
+                if cname.lower() in seen_lower:
+                    return {"error": f"Duplicate target name in request: '{cname}'."}
+                seen_lower.add(cname.lower())
+                cleaned_targets.append(cname)
+
+            src_blk = src_lyt.Block
+            entities_to_copy = []
+            for idx in range(src_blk.Count):
+                if idx == 0:
+                    continue
+                ent = src_blk.Item(idx)
+                if clear_existing_viewports and ent.ObjectName == "AcDbViewport":
+                    continue
+                entities_to_copy.append(ent)
+
+            var_objs = (
+                win32com.client.VARIANT(
+                    pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, entities_to_copy
+                )
+                if entities_to_copy
+                else None
+            )
+
+            created = []
+            skipped = []
+            newly_created_objs = []
+
+            for target_name in cleaned_targets:
+                if target_name.lower() in existing_map:
+                    if skip_if_exists:
+                        skipped.append(target_name)
+                        continue
+                    return {"error": f"Layout '{target_name}' already exists."}
+
+                dst_lyt = doc.Layouts.Add(target_name)
+                dst_lyt.CopyFrom(src_lyt)
+
+                dst_blk = dst_lyt.Block
+                if clear_existing_viewports and dst_blk.Count > 1:
+                    for k in range(dst_blk.Count - 1, 0, -1):
+                        if dst_blk.Item(k).ObjectName == "AcDbViewport":
+                            dst_blk.Item(k).Delete()
+
+                if var_objs is not None:
+                    doc.CopyObjects(var_objs, dst_blk)
+
+                existing_map[target_name.lower()] = dst_lyt
+                newly_created_objs.append(dst_lyt)
+                created.append(target_name)
+
+            ordered_all = _get_ordered_ps_layouts(doc)
+            new_set = {lyt.Name.lower() for lyt in newly_created_objs}
+            base_list = [lyt for lyt in ordered_all if lyt.Name.lower() not in new_set]
+
+            insert_idx = len(base_list)
+            if insert_after_layout:
+                anchor_key = insert_after_layout.strip().lower()
+                for idx, lyt in enumerate(base_list):
+                    if lyt.Name.lower() == anchor_key:
+                        insert_idx = idx + 1
+                        break
+
+            final_sequence = (
+                base_list[:insert_idx] + newly_created_objs + base_list[insert_idx:]
+            )
+            for pos, lyt in enumerate(final_sequence, start=1):
+                if lyt.TabOrder != pos:
+                    lyt.TabOrder = pos
+
+            return {
+                "status": "batch_clone_complete",
+                "source_layout": src_lyt.Name,
+                "created_layouts": created,
+                "skipped_existing": skipped,
+                "clear_existing_viewports": clear_existing_viewports,
+                "final_tab_order": [lyt.Name for lyt in _get_ordered_ps_layouts(doc)],
+            }
+        return com_retry(_clone)
+
+
+@mcp.tool()
+def manage_layout_tabs(
+    renames: Optional[Dict[str, str]] = None,
+    tab_order: Optional[List[str]] = None,
+    start_order_at: int = 1,
+) -> Dict[str, Any]:
+    """
+    Batch rename and/or reorder PaperSpace Layout tabs in a single call.
+    - renames: mapping of {'Old Tab Name': 'New Tab Name'} (safe against name-swap collisions).
+    - tab_order: ordered list of tab names (use post-rename names if combining both).
+      Unlisted tabs keep their relative order after the positioned block.
+    """
+    with autocad_session() as (_, doc):
+        def _manage():
+            renamed_log = []
+
+            if renames:
+                layout_lookup = {
+                    lyt.Name.lower(): lyt for lyt in _get_ordered_ps_layouts(doc)
+                }
+                staged = []
+                target_lower_set = set()
+
+                for old_name, new_name in renames.items():
+                    old_key = old_name.strip().lower()
+                    if old_key not in layout_lookup:
+                        return {"error": f"Layout to rename not found: '{old_name}'."}
+                    err = _validate_layout_name(new_name)
+                    if err:
+                        return {"error": err}
+                    clean_new = new_name.strip()
+                    if clean_new.lower() in target_lower_set:
+                        return {"error": f"Duplicate target name in renames: '{clean_new}'."}
+                    target_lower_set.add(clean_new.lower())
+                    staged.append((layout_lookup[old_key], old_name.strip(), clean_new))
+
+                renaming_old_keys = {item[0].Name.lower() for item in staged}
+                for _, _, clean_new in staged:
+                    if (
+                        clean_new.lower() in layout_lookup
+                        and clean_new.lower() not in renaming_old_keys
+                    ):
+                        return {"error": f"Target name '{clean_new}' already exists on another tab."}
+
+                for idx, (lyt_obj, _, _) in enumerate(staged):
+                    lyt_obj.Name = f"__TMP_RENAME_{idx}_{lyt_obj.Handle}__"
+
+                for lyt_obj, old_label, clean_new in staged:
+                    lyt_obj.Name = clean_new
+                    renamed_log.append({"from": old_label, "to": clean_new})
+
+            if tab_order:
+                current_tabs = _get_ordered_ps_layouts(doc)
+                by_lower = {lyt.Name.lower(): lyt for lyt in current_tabs}
+
+                requested_objs = []
+                requested_keys = set()
+                for name in tab_order:
+                    key = name.strip().lower()
+                    if key == "model":
+                        continue
+                    if key not in by_lower:
+                        return {"error": f"Layout '{name}' in tab_order not found."}
+                    if key not in requested_keys:
+                        requested_objs.append(by_lower[key])
+                        requested_keys.add(key)
+
+                remaining = [
+                    lyt for lyt in current_tabs if lyt.Name.lower() not in requested_keys
+                ]
+                insert_pos = max(0, min(start_order_at - 1, len(remaining)))
+                final_tabs = (
+                    remaining[:insert_pos] + requested_objs + remaining[insert_pos:]
+                )
+
+                for pos, lyt in enumerate(final_tabs, start=1):
+                    if lyt.TabOrder != pos:
+                        lyt.TabOrder = pos
+
+            return {
+                "status": "updated",
+                "renamed": renamed_log,
+                "current_tab_order": [
+                    {"tab_order": lyt.TabOrder, "name": lyt.Name}
+                    for lyt in _get_ordered_ps_layouts(doc)
+                ],
+            }
+        return com_retry(_manage)
 
 if __name__ == "__main__":
     logger.info("Starting AutoCAD MCP Server (stdio) for Google Antigravity...")
