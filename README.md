@@ -48,7 +48,7 @@ Add the following to your `mcp_config.json`:
         "run",
         "--python",
         "3.12",
-        "K:/AgentSpace/00_System_Core/cadCOMPANION/autocad_mcp_server.py"
+        "<PATH_TO_REPO>/autocad_mcp_server.py"
       ],
       "env": {
         "PYTHONUTF8": "1"
